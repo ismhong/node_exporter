@@ -20,8 +20,11 @@ import (
 	"os"
 	"sort"
 
+	"github.com/ismhong/ebpf_exporter/config"
+	"github.com/ismhong/ebpf_exporter/exporter"
 	"github.com/prometheus/common/promlog"
 	"github.com/prometheus/common/promlog/flag"
+	yaml "gopkg.in/yaml.v2"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -161,12 +164,20 @@ func main() {
 		configFile = kingpin.Flag(
 			"web.config",
 			"[EXPERIMENTAL] Path to config yaml file that can enable TLS or authentication.",
-		).Default("").String()
+		).String()
+		bpfConfigFile = kingpin.Flag(
+			"config.file",
+			"Config file path for ebpf_exporter",
+		).File()
+		debug = kingpin.Flag(
+			"debug",
+			"Enable ebpf_exporter debug",
+		).Bool()
 	)
 
 	promlogConfig := &promlog.Config{}
 	flag.AddFlags(kingpin.CommandLine, promlogConfig)
-	kingpin.Version(version.Print("node_exporter"))
+	kingpin.Version(version.Print("node_exporter with ebpf_exporter"))
 	kingpin.HelpFlag.Short('h')
 	kingpin.Parse()
 	logger := promlog.New(promlogConfig)
@@ -177,7 +188,37 @@ func main() {
 	level.Info(logger).Log("msg", "Starting node_exporter", "version", version.Info())
 	level.Info(logger).Log("msg", "Build context", "build_context", version.BuildContext())
 
-	http.Handle(*metricsPath, newHandler(!*disableExporterMetrics, *maxRequests, logger))
+	nodeHandler := newHandler(!*disableExporterMetrics, *maxRequests, logger)
+
+	// Open ebpf_exporter
+	if *bpfConfigFile != nil {
+		config := config.Config{}
+
+		err := yaml.NewDecoder(*bpfConfigFile).Decode(&config)
+		if err != nil {
+			level.Info(logger).Log("Error reading config file: %s", err)
+		}
+
+		e := exporter.New(config)
+		err = e.Attach()
+		if err != nil {
+			level.Info(logger).Log("Error attaching exporter: %s", err)
+		}
+
+		level.Info(logger).Log("Starting with %d programs found in the config", len(config.Programs))
+
+		err = nodeHandler.exporterMetricsRegistry.Register(e)
+		if err != nil {
+			level.Info(logger).Log("Error registering exporter: %s", err)
+		}
+
+		if *debug {
+			level.Info(logger).Log("Debug enabled, exporting raw tables on /tables")
+			http.HandleFunc("/tables", e.TablesHandler)
+		}
+	}
+
+	http.Handle(*metricsPath, nodeHandler)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`<html>
 			<head><title>Node Exporter</title></head>
